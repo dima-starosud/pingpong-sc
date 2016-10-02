@@ -125,20 +125,16 @@ object PingPong {
   }
 
   def staticTraces(cfg: Configuration): Map[ObjectId, Trace] = {
-    import cats.instances.all._
-    import cats.syntax.all._
-
-    import scala.collection.breakOut
     val nl = Point(far = -cfg.ballSize, left = 0)
     val nr = Point(far = -cfg.ballSize, left = cfg.tableWidth)
     val fl = Point(far = cfg.tableLength + cfg.ballSize, left = 0)
     val fr = Point(far = cfg.tableLength + cfg.ballSize, left = cfg.tableWidth)
-    Seq(
-      LeftBorderId -> Seq(nl, fl),
-      RightBorderId -> Seq(nr, fr),
-      NearGoalLineId -> Seq(nl, nr),
-      FarGoalLineId -> Seq(fl, fr)
-    ).map(_.map(createTrace))(breakOut)
+    Map(
+      LeftBorderId -> createTrace(nl, fl),
+      RightBorderId -> createTrace(nr, fr),
+      NearGoalLineId -> createTrace(nl, nr),
+      FarGoalLineId -> createTrace(fl, fr)
+    )
   }
 
   object BallVertices {

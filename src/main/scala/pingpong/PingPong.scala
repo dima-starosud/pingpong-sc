@@ -178,25 +178,13 @@ object PingPong {
     def fr(implicit cfg: Configuration): Direction = Direction(df = cfg.racketDepth, dl = cfg.racketWidth)
   }
 
-  def nearRacketTrace(cfg: Configuration, distToLeft1: Double, distToLeft2: Double): Map[ObjectId, Trace] = {
-    val Seq(dtl1, dtl2) = Seq(distToLeft1, distToLeft2).sorted
+  def nearRacketTrace(distToLeft1: Double, distToLeft2: Double)(implicit cfg: Configuration): Map[ObjectId, Trace] = {
+    import RacketVertices._
+    val Seq(nl1, nl2) = Seq(distToLeft1, distToLeft2).sorted.map(nlNear)
     Map(
-      NearRacketFrontId -> createTrace(
-        Point(far = cfg.racketDistanceBack + cfg.racketDepth, left = dtl1),
-        Point(far = cfg.racketDistanceBack + cfg.racketDepth, left = dtl2 + cfg.racketWidth)
-      ),
-      NearRacketLeftSideId -> createTrace(
-        Point(far = cfg.racketDistanceBack, left = dtl1),
-        Point(far = cfg.racketDistanceBack, left = dtl2),
-        Point(far = cfg.racketDistanceBack + cfg.racketDepth, left = dtl2),
-        Point(far = cfg.racketDistanceBack + cfg.racketDepth, left = dtl1)
-      ),
-      NearRacketRightSideId -> createTrace(
-        Point(far = cfg.racketDistanceBack, left = dtl1 + cfg.racketWidth),
-        Point(far = cfg.racketDistanceBack, left = dtl2 + cfg.racketWidth),
-        Point(far = cfg.racketDistanceBack + cfg.racketDepth, left = dtl2 + cfg.racketWidth),
-        Point(far = cfg.racketDistanceBack + cfg.racketDepth, left = dtl1 + cfg.racketWidth)
-      )
+      NearRacketFrontId -> createTrace(nl1 + fl, nl2 + fr),
+      NearRacketLeftSideId -> createTrace(nl1, nl1 + fl, nl2 + fl, nl2),
+      NearRacketRightSideId -> createTrace(nl1 + nr, nl1 + fr, nl2 + fr, nl2 + nr)
     )
   }
 
@@ -228,7 +216,7 @@ object PingPong {
   ): Map[ObjectId, Trace] = {
     val s1 = straightMove(cfg, s0, nearRacket, farRacket, dt)
     staticTraces(cfg) ++
-      nearRacketTrace(cfg, s0.nearRacketDistToLeft, s1.nearRacketDistToLeft) ++
+      nearRacketTrace(s0.nearRacketDistToLeft, s1.nearRacketDistToLeft)(cfg) ++
       farRacketTrace(cfg, s0.farRacketDistToLeft, s1.farRacketDistToLeft) ++ Seq(
       BallId -> ballTrace(s0.ball.pos, s1.ball.pos)(cfg))
   }

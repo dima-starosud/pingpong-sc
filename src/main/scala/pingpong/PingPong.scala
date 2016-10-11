@@ -3,7 +3,6 @@ package pingpong
 import ungeneric.Constrained
 
 import scala.annotation.tailrec
-import scala.util.Random
 
 object PingPong {
 
@@ -50,7 +49,7 @@ object PingPong {
   final case class Configuration(
     tableWidth: Int, tableLength: Int,
     ballSize: Int, ballStartSpeed: Double,
-    racketWidth: Int, racketDepth: Int, racketDistanceBack: Int)
+    racketWidth: Int, racketDepth: Int, racketDistanceBack: Int, racketSpeed: Double)
 
   final case class RacketDirection(dl: Double = 0.0) {
     def toDirection: Direction = Direction(df = 0, dl = dl)
@@ -65,6 +64,7 @@ object PingPong {
   def reflect(d: Direction, n: Normal.Value): Direction = d - 2 * (d * n) * n
 
   final type RacketHandler = (Configuration, State) => RacketDirection
+  final type KickoffHandler = (Configuration, Option[EndOfRound]) => State
 
   def consistent(c: Configuration, s: State): Boolean =
     collisions(traces(c, s, RacketDirection(), RacketDirection(), 0)).isEmpty
@@ -95,7 +95,7 @@ object PingPong {
 
   case object FarGoalLineId extends ObjectId
 
-  final case class Trace(lines: Seq[Line])
+  final case class Trace(lines: Seq[Line]) extends AnyVal
 
   def createTrace(points: Point*): Trace = {
     val lines = points match {
@@ -119,8 +119,8 @@ object PingPong {
         else loop(t0, middle)
       }
     }
-    if (!predicate(t0)) t0
-    else if (predicate(t1)) t1
+    require(predicate(t0))
+    if (predicate(t1)) t1
     else loop(t0, t1)
   }
 
@@ -184,25 +184,13 @@ object PingPong {
     )
   }
 
-  def farRacketTrace(cfg: Configuration, distToLeft1: Double, distToLeft2: Double): Map[ObjectId, Trace] = {
-    val Seq(dtl1, dtl2) = Seq(distToLeft1, distToLeft2).sorted
+  def farRacketTrace(distToLeft1: Double, distToLeft2: Double)(implicit cfg: Configuration): Map[ObjectId, Trace] = {
+    import RacketVertices._
+    val Seq(nl1, nl2) = Seq(distToLeft1, distToLeft2).sorted.map(nlFar)
     Map(
-      FarRacketFrontId -> createTrace(
-        Point(far = cfg.tableLength - cfg.racketDistanceBack - cfg.racketDepth, left = dtl1),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack - cfg.racketDepth, left = dtl2 + cfg.racketWidth)
-      ),
-      FarRacketLeftSideId -> createTrace(
-        Point(far = cfg.tableLength - cfg.racketDistanceBack, left = dtl1),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack, left = dtl2),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack - cfg.racketDepth, left = dtl2),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack - cfg.racketDepth, left = dtl1)
-      ),
-      FarRacketRightSideId -> createTrace(
-        Point(far = cfg.tableLength - cfg.racketDistanceBack, left = dtl1 + cfg.racketWidth),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack, left = dtl2 + cfg.racketWidth),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack - cfg.racketDepth, left = dtl2 + cfg.racketWidth),
-        Point(far = cfg.tableLength - cfg.racketDistanceBack - cfg.racketDepth, left = dtl1 + cfg.racketWidth)
-      )
+      FarRacketFrontId -> createTrace(nl1, nl2 + nr),
+      FarRacketLeftSideId -> createTrace(nl1, nl1 + fl, nl2 + fl, nl2),
+      FarRacketRightSideId -> createTrace(nl1 + nr, nl1 + fr, nl2 + fr, nl2 + nr)
     )
   }
 
@@ -213,7 +201,7 @@ object PingPong {
     val s1 = straightMove(cfg, s0, nearRacket, farRacket, dt)
     staticTraces(cfg) ++
       nearRacketTrace(s0.nearRacketDistToLeft, s1.nearRacketDistToLeft)(cfg) ++
-      farRacketTrace(cfg, s0.farRacketDistToLeft, s1.farRacketDistToLeft) ++ Seq(
+      farRacketTrace(s0.farRacketDistToLeft, s1.farRacketDistToLeft)(cfg) ++ Seq(
       BallId -> ballTrace(s0.ball.pos, s1.ball.pos)(cfg))
   }
 
@@ -262,19 +250,27 @@ object PingPong {
     )
   }
 
+  sealed trait RacketId {
+    def fold[T](near: => T, far: => T): T
+  }
+
+  case object NearRacketId extends RacketId {
+    override def fold[T](near: => T, far: => T): T = near
+  }
+
+  case object FarRacketId extends RacketId {
+    override def fold[T](near: => T, far: => T): T = far
+  }
+
   sealed trait CollisionResult
 
   case object StopNearRacket extends CollisionResult
 
   case object StopFarRacket extends CollisionResult
 
-  final case class KickOffBall(dir: Normal.Value) extends CollisionResult
-
-  final case class ReflectBall(n: Normal.Value, impulse: Direction = Direction(0, 0)) extends CollisionResult
+  final case class ReflectBall(n: Normal.Value, racket: Option[RacketId] = None) extends CollisionResult
 
   final case class DynamicPart(ball: Ball, nearRacket: RacketDirection, farRacket: RacketDirection)
-
-  type CollisionHandler = DynamicPart => CollisionResult
 
   object Directions {
     val right = Normal.apply(Direction(df = 0, dl = 1))
@@ -283,95 +279,107 @@ object PingPong {
     val backward = Normal.apply(Direction(df = -1, dl = 0))
   }
 
-  val collisionHandlers = {
+  val collisionResults: Map[Set[ObjectId], CollisionResult] = {
     import Directions._
 
-    val nearRacketStop: CollisionHandler = dp => StopNearRacket
     val nearRacketStops =
-      (for {
+      for {
         s <- Seq(NearRacketFrontId, NearRacketLeftSideId, NearRacketRightSideId)
         b <- Seq(LeftBorderId, RightBorderId)
       } yield {
-        Set[ObjectId](s, b) -> nearRacketStop
-      }).toMap
+        Set[ObjectId](s, b) -> StopNearRacket
+      }
 
-    val farRacketStop: CollisionHandler = dp => StopFarRacket
     val farRacketStops =
-      (for {
+      for {
         s <- Seq(FarRacketFrontId, FarRacketLeftSideId, FarRacketRightSideId)
         b <- Seq(LeftBorderId, RightBorderId)
       } yield {
-        Set[ObjectId](s, b) -> farRacketStop
-      }).toMap
+        Set[ObjectId](s, b) -> StopFarRacket
+      }
 
-    val ballReflections = Map[Set[ObjectId], CollisionHandler](
-      (Set(BallId, NearRacketFrontId), dp => ReflectBall(forward, dp.nearRacket.toDirection)),
-      (Set(BallId, NearRacketLeftSideId), dp => ReflectBall(right, dp.nearRacket.toDirection)),
-      (Set(BallId, NearRacketRightSideId), dp => ReflectBall(left, dp.nearRacket.toDirection)),
+    val ballReflections = Map[Set[ObjectId], CollisionResult](
+      (Set(BallId, NearRacketFrontId), ReflectBall(forward, Some(NearRacketId))),
+      (Set(BallId, NearRacketLeftSideId), ReflectBall(right, Some(NearRacketId))),
+      (Set(BallId, NearRacketRightSideId), ReflectBall(left, Some(NearRacketId))),
 
-      (Set(BallId, FarRacketFrontId), dp => ReflectBall(backward, dp.farRacket.toDirection)),
-      (Set(BallId, FarRacketLeftSideId), dp => ReflectBall(right, dp.farRacket.toDirection)),
-      (Set(BallId, FarRacketRightSideId), dp => ReflectBall(left, dp.farRacket.toDirection)),
+      (Set(BallId, FarRacketFrontId), ReflectBall(backward, Some(FarRacketId))),
+      (Set(BallId, FarRacketLeftSideId), ReflectBall(right, Some(FarRacketId))),
+      (Set(BallId, FarRacketRightSideId), ReflectBall(left, Some(FarRacketId))),
 
-      (Set(BallId, LeftBorderId), dp => ReflectBall(right)),
-      (Set(BallId, RightBorderId), dp => ReflectBall(left)),
-
-      (Set(BallId, NearGoalLineId), dp => KickOffBall(backward)),
-      (Set(BallId, FarGoalLineId), dp => KickOffBall(forward))
+      (Set(BallId, LeftBorderId), ReflectBall(right)),
+      (Set(BallId, RightBorderId), ReflectBall(left))
     )
 
-    ballReflections ++ nearRacketStops ++ farRacketStops
+    val endsOfRound = Map[Set[ObjectId], EndOfRound](
+      (Set(BallId, NearGoalLineId), BallCrossedNearGoalLine),
+      (Set(BallId, FarGoalLineId), BallCrossedFarGoalLine)
+    )
+
+    ballReflections ++ nearRacketStops ++ farRacketStops ++ endsOfRound
   }
 
   def handleCollisions(
     cfg: Configuration, collisions: Seq[(ObjectId, ObjectId)],
     ball: Ball, nearRacket: RacketDirection, farRacket: RacketDirection
-  ): DynamicPart = {
+  ): Either[EndOfRound, DynamicPart] = {
     val results = collisions.map {
-      case (i1, i2) => collisionHandlers(Set(i1, i2))(DynamicPart(ball, nearRacket, farRacket))
+      case (i1, i2) => collisionResults(Set(i1, i2))
     }
-    val kickOff = results.collect { case KickOffBall(n) => n } match {
+    val kickOff = results.collect { case eor: EndOfRound => eor } match {
       case Seq() => None
-      case Seq(n) => Some(kickoff(cfg, n))
+      case Seq(n) => Some(n)
     }
     val reflection = results
-      .collect { case ReflectBall(n, i) => reflect(ball.dir, n) + i }
+      .collect {
+        case ReflectBall(n, r) =>
+          reflect(ball.dir, n) + r.fold(Direction(0, 0))(_.fold(nearRacket, farRacket).toDirection)
+      }
       .reduceOption(_ + _)
       .map(dir => ball.copy(dir = dir))
-    DynamicPart(
-      ball = kickOff.orElse(reflection).getOrElse(ball),
+    kickOff.fold[Either[EndOfRound, DynamicPart]](Right(DynamicPart(
+      ball = reflection.getOrElse(ball),
       nearRacket = if (results.contains(StopNearRacket)) RacketDirection(0) else nearRacket,
       farRacket = if (results.contains(StopFarRacket)) RacketDirection(0) else farRacket
-    )
+    )))(Left(_))
   }
 
-  @tailrec
+  sealed trait EndOfRound extends CollisionResult
+
+  case object BallCrossedNearGoalLine extends EndOfRound
+
+  case object BallCrossedFarGoalLine extends EndOfRound
+
   def smartMove(
     cfg: Configuration, s0: State,
     nearRacket: RacketDirection, farRacket: RacketDirection, dt: Double
-  ): State = {
+  ): Either[EndOfRound, State] = {
     val args = (cfg, s0, nearRacket, farRacket, dt)
     require(consistent(cfg, s0), args)
     val getCollisions = (s: State, t: Double) => collisions(traces(cfg, s, nearRacket, farRacket, t))
     if (getCollisions(s0, dt).isEmpty) {
-      straightMove(cfg, s0, nearRacket, farRacket, dt).ensuring(consistent(cfg, _), args)
+      Right(straightMove(cfg, s0, nearRacket, farRacket, dt).ensuring(consistent(cfg, _), args))
     } else {
       val dt1 = partition(t0 = 0, t1 = dt, eps = Eps, getCollisions(s0, _).isEmpty)
       val s1 = straightMove(cfg, s0, nearRacket, farRacket, dt1)
-      val DynamicPart(b2, nearRacket2, farRacket2) =
-        handleCollisions(cfg, getCollisions(s1, dt1 + Eps), s1.ball, nearRacket, farRacket)
-      smartMove(cfg, s1.copy(ball = b2), nearRacket2, farRacket2, dt - dt1)
+      handleCollisions(cfg, getCollisions(s1, dt1 + Eps), s1.ball, nearRacket, farRacket).right.flatMap {
+        case DynamicPart(b2, nearRacket2, farRacket2) =>
+          smartMove(cfg, s1.copy(ball = b2), nearRacket2, farRacket2, dt - dt1)
+      }
     }
   }
 
   def iterate(
-    cfg: Configuration, s0: State,
+    cfg: Configuration,
+    kickoff: KickoffHandler,
     nearRacket: RacketHandler, farRacket: RacketHandler,
     dt: Double
   ): Iterator[State] = {
+    val s0 = kickoff(cfg, None)
     require(consistent(cfg, s0))
-    Iterator.iterate(s0) { s =>
-      smartMove(cfg, s, nearRacket(cfg, s), farRacket(cfg, s), dt)
+    Iterator.iterate(s0) { s0 =>
+      val s1 = smartMove(cfg, s0, nearRacket(cfg, s0), farRacket(cfg, s0), dt)
+      s1.left.map(eor => kickoff(cfg, Some(eor))).merge
     }
   }
 
@@ -424,8 +432,10 @@ object PingPong {
     black.toSeq ++ white
   }
 
-  def randomRacketHandler(cfg: Configuration, state: State): RacketDirection = {
-    RacketDirection(Seq(0, -10, 10)(Random.nextInt(3)))
+  def ballLeftRacketHandler(racketId: RacketId, cfg: Configuration, state: State): RacketDirection = {
+    val current = racketId.fold(state.nearRacketDistToLeft, state.farRacketDistToLeft)
+    val target = state.ball.pos.left
+    RacketDirection((target - current).signum * cfg.racketSpeed)
   }
 
   def statesToPixels(cfg: Configuration, ss: Iterator[State]): Iterator[Seq[putpixel.Pixel]] = {
@@ -441,16 +451,19 @@ object PingPong {
     val cfg = Configuration(
       tableWidth = 300, tableLength = 600,
       ballSize = 10, ballStartSpeed = 10,
-      racketWidth = 300, racketDepth = 20, racketDistanceBack = 30
+      racketWidth = 300, racketDepth = 20, racketDistanceBack = 30, racketSpeed = 0
     )
+    val centeredRacket = (cfg.tableWidth - cfg.racketWidth) / 2.0
 
-    val s0 = {
-      val distToLeft = (cfg.tableWidth - cfg.racketWidth) / 2.0
-      State(distToLeft, distToLeft, kickoff(cfg, Normal.apply(Direction(1, 1))))
+    def ko(cfg: Configuration, eor: Option[EndOfRound]): State = {
+      require(eor.isEmpty)
+      State(centeredRacket, centeredRacket, kickoff(cfg, Normal.apply(Direction(1, 1))))
     }
 
+    def it() = iterate(cfg, ko, (_, _) => RacketDirection(), (_, _) => RacketDirection(), dt = 1)
+
     def draw(): Unit = {
-      val ss = iterate(cfg, s0, (_, _) => RacketDirection(), (_, _) => RacketDirection(), dt = 1)
+      val ss = it()
       val pxs = statesToPixels(cfg, ss)
       val pp = putpixel.PutPixel.start(width = cfg.tableLength, height = cfg.tableWidth)
       for (ps <- pxs) {
